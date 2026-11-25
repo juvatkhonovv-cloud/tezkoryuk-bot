@@ -11,14 +11,22 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# Sozlamalar (Render Environment Variables'dan olinadi)
-API_ID = int(os.getenv("31960231"))
-API_HASH = os.getenv("e24755865c22300fd887338746bc5226")
-BOT_TOKEN = os.getenv("9067870621:AAHEt_TT27Bbfa_HkeIxF5w-Rly_Dol-CHU")
-SESSION_STRING = os.getenv("SESSION_STRING", "1ApWapzMBu70tmemLp3AkzCvT6JeNUQYc2TGSH_ycXDYuEQpuQ0r76t9zuMV64Xv3xg-lfO4AITchTXIyG2K0fIxVITU5yAe010Gb0-RvENaT8CyBkTvvGddcouaA90iWUNP_hvnPnh3-2crEZAOqVlf2-LsvtTQkQr8HfikQc9OTnGZdLxu4kx68aeUONaBS3mNyYMfoDbuAc0OpKdRQubzf8o0LKt8iLWBJBwZ9Y4j8lse93u-CpHRRBkYPAc8zGed1TOTsQcBpZSNBmuEp8D60hRyEtnipFJViLbGNs2yg5ofg0BJrXk3vrrJGL4zMFmrTYYwsnSaa3-ZAUi98JHl_")
-DATABASE_URL = os.getenv("postgresql://postgres.rhbpenvhsrwkqurjkmqr:[Mondarinn98O]@aws-0-eu-central-1.pooler.supabase.com:5432/postgres", "")
-
 logging.basicConfig(level=logging.INFO)
+
+
+def get_required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Muhit o'zgaruvchisi topilmadi: {name}")
+    return value
+
+
+# Barcha maxfiy kalitlar faqat Render Environment Variables'dan olinadi
+API_ID = int(get_required_env("API_ID"))
+API_HASH = get_required_env("API_HASH")
+BOT_TOKEN = get_required_env("BOT_TOKEN")
+SESSION_STRING = get_required_env("SESSION_STRING")
+DATABASE_URL = get_required_env("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -56,8 +64,6 @@ user_temp = {}
 
 async def init_db():
     global db_pool
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL o'zgaruvchisi kiritilmagan!")
     db_pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
@@ -334,7 +340,6 @@ async def handle_new_cargo(event):
         )
         for row in subscribers:
             sub_truck = row["truck_type"] or "all"
-            # Agar obunachi aniq mashina tanlagan bo'lsa va e'londa boshqa mashina ko'rsatilgan bo'lsa — o'tkazib yuboramiz
             if sub_truck != "all" and detected_truck != "general" and sub_truck != detected_truck:
                 continue
 
