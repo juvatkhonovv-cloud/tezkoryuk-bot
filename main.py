@@ -41,14 +41,23 @@ REGIONS = {
     "qoraqalpogiston": ("Qoraqalpog'iston", ["qoraqalpog'iston", "nukus", "beruniy", "to'rtko'l", "ellikkala", "xo'jayli"]),
 }
 
-temp_from = {}
+# Yuk mashinasi turlari va matndagi kalit so'zlari
+TRUCK_TYPES = {
+    "all": ("🚛 Barcha mashinalar", []),
+    "fura": ("🚚 Fura (Tent / 20t)", ["fura", "tent", "20t", "20 t", "20 tonna", "shalanda", "mega", "pritsep"]),
+    "isuzu": ("🚛 Isuzu / MAN (5-10t)", ["isuzu", "isuzi", "man", "kamaz", "zil", "gaz-53", "gaz 53", "5t", "10t", "5 tonna", "10 tonna"]),
+    "gazel": ("🚐 Gazel / Labo / Damas", ["gazel", "labo", "damas", "porter", "changan", "bongo", "kichik yuk"]),
+    "ref": ("❄️ Refrijerator (Muzlatkich)", ["ref", "refrijerator", "muzlatkich", "xolodilnik", "termo", "muzlatgich"]),
+}
+
+# Vaqtinchalik tanlovlarni saqlash: {user_id: {"from": "...", "to": "..."}}
+user_temp = {}
 
 
 async def init_db():
     global db_pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL o'zgaruvchisi kiritilmagan!")
-    # Supabase Session/Transaction pooler uchun statement_cache_size=0 muhim
     db_pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
@@ -61,9 +70,14 @@ async def init_db():
                 user_id BIGINT PRIMARY KEY,
                 from_region TEXT NOT NULL,
                 to_region TEXT NOT NULL,
+                truck_type TEXT DEFAULT 'all',
                 active BOOLEAN DEFAULT TRUE,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+        """)
+        await conn.execute("""
+            ALTER TABLE obunachilar
+            ADD COLUMN IF NOT EXISTS truck_type TEXT DEFAULT 'all';
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS elonlar (
@@ -73,10 +87,15 @@ async def init_db():
                 chat_title TEXT,
                 from_region TEXT NOT NULL,
                 to_region TEXT NOT NULL,
+                truck_type TEXT DEFAULT 'general',
                 text_body TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(chat_id, message_id)
             );
+        """)
+        await conn.execute("""
+            ALTER TABLE elonlar
+            ADD COLUMN IF NOT EXISTS truck_type TEXT DEFAULT 'general';
         """)
     logging.info("PostgreSQL (Supabase) bazasi muvaffaqiyatli ulandi!")
 
@@ -94,6 +113,13 @@ def build_regions_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def build_trucks_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    for key, (label, _) in TRUCK_TYPES.items():
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"truck:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -101,13 +127,19 @@ async def cmd_start(message: types.Message):
 
     if db_pool:
         row = await db_pool.fetchrow(
-            "SELECT from_region, to_region, active FROM obunachilar WHERE user_id = $1",
+            "SELECT from_region, to_region, truck_type, active FROM obunachilar WHERE user_id = $1",
             user_id
         )
         if row and row["active"] and row["from_region"] in REGIONS and row["to_region"] in REGIONS:
             f_name = REGIONS[row["from_region"]][0]
             t_name = REGIONS[row["to_region"]][0]
-            active_text = f"\n\n✅ Hozirgi faol yo'nalishingiz: <b>{f_name} ➔ {t_name}</b>"
+            tr_key = row["truck_type"] if row["truck_type"] in TRUCK_TYPES else "all"
+            tr_name = TRUCK_TYPES[tr_key][0]
+            active_text = (
+                f"\n\n✅ Hozirgi faol sozlamangiz:\n"
+                f"📍 Yo'nalish: <b>{f_name} ➔ {t_name}</b>\n"
+                f"🚛 Mashina: <b>{tr_name}</b>"
+            )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚛 Yo'nalish tanlash (Qayerdan -> Qayerga)", callback_data="choose_route")],
@@ -115,7 +147,7 @@ async def cmd_start(message: types.Message):
     ])
     await message.answer(
         "Assalomu alaykum! <b>Tezkor Yuk</b> botiga xush kelibsiz.\n\n"
-        f"Kerakli viloyatlararo yo'nalishni tanlang — kanallarga yangi yuk e'loni tushishi bilan sizga yuboraman.{active_text}",
+        f"Kerakli viloyatlararo yo'nalish va mashina turini tanlang — kanallarga yangi yuk e'loni tushishi bilan sizga yuboraman.{active_text}",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -124,7 +156,7 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(F.data == "choose_route")
 async def step_from(callback: types.CallbackQuery):
     await callback.message.edit_text(
-        "📍 <b>QAYERDAN</b> yuk olmoqchisiz? Viloyatni tanlang:",
+        "📍 <b>1-qadam: QAYERDAN</b> yuk olmoqchisiz? Viloyatni tanlang:",
         reply_markup=build_regions_keyboard("from"),
         parse_mode="HTML"
     )
@@ -133,47 +165,78 @@ async def step_from(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("from:"))
 async def step_to(callback: types.CallbackQuery):
     from_key = callback.data.split(":")[1]
-    temp_from[callback.from_user.id] = from_key
+    user_temp[callback.from_user.id] = {"from": from_key}
     from_name = REGIONS[from_key][0]
     await callback.message.edit_text(
-        f"✅ Qayerdan: <b>{from_name}</b>\n\n🏁 Endi <b>QAYERGA</b> borishingizni tanlang:",
+        f"✅ Qayerdan: <b>{from_name}</b>\n\n"
+        f"🏁 <b>2-qadam: QAYERGA</b> borishingizni tanlang:",
         reply_markup=build_regions_keyboard("to"),
         parse_mode="HTML"
     )
 
 
 @dp.callback_query(F.data.startswith("to:"))
-async def save_route(callback: types.CallbackQuery):
+async def step_truck(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     to_key = callback.data.split(":")[1]
-    from_key = temp_from.get(user_id)
+    data = user_temp.get(user_id)
 
-    if not from_key:
+    if not data or "from" not in data:
         await callback.answer("Avval 'Qayerdan' viloyatini tanlang!", show_alert=True)
         return
 
+    data["to"] = to_key
+    from_name = REGIONS[data["from"]][0]
+    to_name = REGIONS[to_key][0]
+
+    await callback.message.edit_text(
+        f"✅ Yo'nalish: <b>{from_name} ➔ {to_name}</b>\n\n"
+        f"🚛 <b>3-qadam:</b> Qaysi turdagi mashina uchun yuk kerak?",
+        reply_markup=build_trucks_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("truck:"))
+async def save_route(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    truck_key = callback.data.split(":")[1]
+    data = user_temp.get(user_id)
+
+    if not data or "from" not in data or "to" not in data:
+        await callback.answer("Avval yo'nalishni tanlang!", show_alert=True)
+        return
+
+    from_key = data["from"]
+    to_key = data["to"]
+    if truck_key not in TRUCK_TYPES:
+        truck_key = "all"
+
     if db_pool:
         await db_pool.execute("""
-            INSERT INTO obunachilar (user_id, from_region, to_region, active, updated_at)
-            VALUES ($1, $2, $3, TRUE, NOW())
+            INSERT INTO obunachilar (user_id, from_region, to_region, truck_type, active, updated_at)
+            VALUES ($1, $2, $3, $4, TRUE, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 from_region = EXCLUDED.from_region,
                 to_region = EXCLUDED.to_region,
+                truck_type = EXCLUDED.truck_type,
                 active = TRUE,
                 updated_at = NOW();
-        """, user_id, from_key, to_key)
+        """, user_id, from_key, to_key, truck_key)
 
     from_name = REGIONS[from_key][0]
     to_name = REGIONS[to_key][0]
+    truck_name = TRUCK_TYPES[truck_key][0]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Yo'nalishni o'zgartirish", callback_data="choose_route")],
+        [InlineKeyboardButton(text="🔄 Yo'nalish / Mashinani o'zgartirish", callback_data="choose_route")],
         [InlineKeyboardButton(text="🛑 Qidiruvni to'xtatish", callback_data="stop_search")]
     ])
     await callback.message.edit_text(
-        f"🎯 Yo'nalish faollashtirildi va bazaga saqlandi!\n\n"
-        f"📍 <b>{from_name} ➔ {to_name}</b>\n\n"
-        f"Shu yo'nalish bo'yicha kanallarda yangi yuk chiqishi bilan darhol xabar beraman.",
+        f"🎯 Sozlamalar faollashtirildi va bazaga saqlandi!\n\n"
+        f"📍 Yo'nalish: <b>{from_name} ➔ {to_name}</b>\n"
+        f"🚛 Mashina turi: <b>{truck_name}</b>\n\n"
+        f"Shu moslikdagi yangi yuk chiqishi bilan darhol xabar beraman.",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -209,6 +272,17 @@ def detect_route(text: str):
     return None, None
 
 
+def detect_truck_type(text: str) -> str:
+    """Matndan mashina turini aniqlaydi. Topilmasa 'general' qaytaradi."""
+    clean = text.lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    for key in ("ref", "fura", "isuzu", "gazel"):
+        _, keywords = TRUCK_TYPES[key]
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}", clean):
+                return key
+    return "general"
+
+
 # Telethon Userbot — kanallar va guruhlardan e'lonlarni kuzatish
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -225,6 +299,8 @@ async def handle_new_cargo(event):
     if not from_reg or not to_reg:
         return
 
+    detected_truck = detect_truck_type(text)
+
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Yuk kanali")
     username = getattr(chat, "username", None)
@@ -232,26 +308,36 @@ async def handle_new_cargo(event):
 
     if db_pool:
         inserted = await db_pool.fetchval("""
-            INSERT INTO elonlar (chat_id, message_id, chat_title, from_region, to_region, text_body)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO elonlar (chat_id, message_id, chat_title, from_region, to_region, truck_type, text_body)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (chat_id, message_id) DO NOTHING
             RETURNING id;
-        """, event.chat_id, event.id, chat_title, from_reg, to_reg, text[:2000])
+        """, event.chat_id, event.id, chat_title, from_reg, to_reg, detected_truck, text[:2000])
         if not inserted:
             return
 
+    truck_badge = ""
+    if detected_truck in TRUCK_TYPES:
+        truck_badge = f"\n🚛 Mashina: {TRUCK_TYPES[detected_truck][0]}"
+
     msg_body = (
-        f"🆕 <b>Yangi yuk! ({REGIONS[from_reg][0]} ➔ {REGIONS[to_reg][0]})</b>\n"
+        f"🆕 <b>Yangi yuk! ({REGIONS[from_reg][0]} ➔ {REGIONS[to_reg][0]})</b>"
+        f"{truck_badge}\n"
         f"📢 Manba: {chat_title}\n\n"
         f"{text[:1500]}{link}"
     )
 
     if db_pool:
         subscribers = await db_pool.fetch(
-            "SELECT user_id FROM obunachilar WHERE active = TRUE AND from_region = $1 AND to_region = $2",
+            "SELECT user_id, truck_type FROM obunachilar WHERE active = TRUE AND from_region = $1 AND to_region = $2",
             from_reg, to_reg
         )
         for row in subscribers:
+            sub_truck = row["truck_type"] or "all"
+            # Agar obunachi aniq mashina tanlagan bo'lsa va e'londa boshqa mashina ko'rsatilgan bo'lsa — o'tkazib yuboramiz
+            if sub_truck != "all" and detected_truck != "general" and sub_truck != detected_truck:
+                continue
+
             uid = row["user_id"]
             try:
                 await bot.send_message(uid, msg_body, parse_mode="HTML", disable_web_page_preview=True)
