@@ -1,0 +1,290 @@
+import asyncio
+import logging
+import os
+import re
+import asyncpg
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.filters import CommandStart
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+
+# Sozlamalar (Render Environment Variables'dan olinadi)
+API_ID = int(os.getenv("31960231"))
+API_HASH = os.getenv("e24755865c22300fd887338746bc5226")
+BOT_TOKEN = os.getenv("9067870621:AAHEt_TT27Bbfa_HkeIxF5w-Rly_Dol-CHU")
+SESSION_STRING = os.getenv("SESSION_STRING", "1ApWapzMBu70tmemLp3AkzCvT6JeNUQYc2TGSH_ycXDYuEQpuQ0r76t9zuMV64Xv3xg-lfO4AITchTXIyG2K0fIxVITU5yAe010Gb0-RvENaT8CyBkTvvGddcouaA90iWUNP_hvnPnh3-2crEZAOqVlf2-LsvtTQkQr8HfikQc9OTnGZdLxu4kx68aeUONaBS3mNyYMfoDbuAc0OpKdRQubzf8o0LKt8iLWBJBwZ9Y4j8lse93u-CpHRRBkYPAc8zGed1TOTsQcBpZSNBmuEp8D60hRyEtnipFJViLbGNs2yg5ofg0BJrXk3vrrJGL4zMFmrTYYwsnSaa3-ZAUi98JHl_")
+DATABASE_URL = os.getenv("postgresql://postgres.rhbpenvhsrwkqurjkmqr:[Mondarinn98O]@aws-0-eu-central-1.pooler.supabase.com:5432/postgres", "")
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+db_pool: asyncpg.Pool | None = None
+
+# O'zbekiston viloyatlari va ularning matndagi kalit so'zlari
+REGIONS = {
+    "xorazm": ("Xorazm", ["xorazm", "urganch", "xiva", "xonqa", "hazorasp", "gurlan", "shovot", "bog'ot", "yangibozor"]),
+    "toshkent": ("Toshkent", ["toshkent", "tashkent", "chirchiq", "olmaliq", "angren", "bekobod", "zangiota"]),
+    "samarqand": ("Samarqand", ["samarqand", "urgut", "kattaqo'rg'on", "bulung'ur", "jomboy"]),
+    "buxoro": ("Buxoro", ["buxoro", "g'ijduvon", "kogon", "qorako'l", "romitan"]),
+    "qashqadaryo": ("Qashqadaryo", ["qashqadaryo", "qarshi", "shahrisabz", "kitob", "g'uzor", "koson"]),
+    "surxondaryo": ("Surxondaryo", ["surxondaryo", "termiz", "denov", "sherobod", "boysun"]),
+    "navoiy": ("Navoiy", ["navoiy", "zarafshon", "karmana", "nurota"]),
+    "jizzax": ("Jizzax", ["jizzax", "zomin", "g'allaorol", "paxtakor"]),
+    "sirdaryo": ("Sirdaryo", ["sirdaryo", "guliston", "yangiyer", "shirin"]),
+    "fargona": ("Farg'ona", ["farg'ona", "fargona", "qo'qon", "marg'ilon", "quva", "rishton"]),
+    "andijon": ("Andijon", ["andijon", "asaka", "shahrixon", "xonobod"]),
+    "namangan": ("Namangan", ["namangan", "chust", "pop", "kosonsoy"]),
+    "qoraqalpogiston": ("Qoraqalpog'iston", ["qoraqalpog'iston", "nukus", "beruniy", "to'rtko'l", "ellikkala", "xo'jayli"]),
+}
+
+temp_from = {}
+
+
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL o'zgaruvchisi kiritilmagan!")
+    # Supabase Session/Transaction pooler uchun statement_cache_size=0 muhim
+    db_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        statement_cache_size=0
+    )
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS obunachilar (
+                user_id BIGINT PRIMARY KEY,
+                from_region TEXT NOT NULL,
+                to_region TEXT NOT NULL,
+                active BOOLEAN DEFAULT TRUE,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS elonlar (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                message_id BIGINT,
+                chat_title TEXT,
+                from_region TEXT NOT NULL,
+                to_region TEXT NOT NULL,
+                text_body TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(chat_id, message_id)
+            );
+        """)
+    logging.info("PostgreSQL (Supabase) bazasi muvaffaqiyatli ulandi!")
+
+
+def build_regions_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    buttons = []
+    row = []
+    for key, (label, _) in REGIONS.items():
+        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    active_text = ""
+
+    if db_pool:
+        row = await db_pool.fetchrow(
+            "SELECT from_region, to_region, active FROM obunachilar WHERE user_id = $1",
+            user_id
+        )
+        if row and row["active"] and row["from_region"] in REGIONS and row["to_region"] in REGIONS:
+            f_name = REGIONS[row["from_region"]][0]
+            t_name = REGIONS[row["to_region"]][0]
+            active_text = f"\n\n✅ Hozirgi faol yo'nalishingiz: <b>{f_name} ➔ {t_name}</b>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚛 Yo'nalish tanlash (Qayerdan -> Qayerga)", callback_data="choose_route")],
+        [InlineKeyboardButton(text="🛑 Qidiruvni to'xtatish", callback_data="stop_search")]
+    ])
+    await message.answer(
+        "Assalomu alaykum! <b>Tezkor Yuk</b> botiga xush kelibsiz.\n\n"
+        f"Kerakli viloyatlararo yo'nalishni tanlang — kanallarga yangi yuk e'loni tushishi bilan sizga yuboraman.{active_text}",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "choose_route")
+async def step_from(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "📍 <b>QAYERDAN</b> yuk olmoqchisiz? Viloyatni tanlang:",
+        reply_markup=build_regions_keyboard("from"),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("from:"))
+async def step_to(callback: types.CallbackQuery):
+    from_key = callback.data.split(":")[1]
+    temp_from[callback.from_user.id] = from_key
+    from_name = REGIONS[from_key][0]
+    await callback.message.edit_text(
+        f"✅ Qayerdan: <b>{from_name}</b>\n\n🏁 Endi <b>QAYERGA</b> borishingizni tanlang:",
+        reply_markup=build_regions_keyboard("to"),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("to:"))
+async def save_route(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    to_key = callback.data.split(":")[1]
+    from_key = temp_from.get(user_id)
+
+    if not from_key:
+        await callback.answer("Avval 'Qayerdan' viloyatini tanlang!", show_alert=True)
+        return
+
+    if db_pool:
+        await db_pool.execute("""
+            INSERT INTO obunachilar (user_id, from_region, to_region, active, updated_at)
+            VALUES ($1, $2, $3, TRUE, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                from_region = EXCLUDED.from_region,
+                to_region = EXCLUDED.to_region,
+                active = TRUE,
+                updated_at = NOW();
+        """, user_id, from_key, to_key)
+
+    from_name = REGIONS[from_key][0]
+    to_name = REGIONS[to_key][0]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Yo'nalishni o'zgartirish", callback_data="choose_route")],
+        [InlineKeyboardButton(text="🛑 Qidiruvni to'xtatish", callback_data="stop_search")]
+    ])
+    await callback.message.edit_text(
+        f"🎯 Yo'nalish faollashtirildi va bazaga saqlandi!\n\n"
+        f"📍 <b>{from_name} ➔ {to_name}</b>\n\n"
+        f"Shu yo'nalish bo'yicha kanallarda yangi yuk chiqishi bilan darhol xabar beraman.",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "stop_search")
+async def stop_search(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if db_pool:
+        await db_pool.execute(
+            "UPDATE obunachilar SET active = FALSE, updated_at = NOW() WHERE user_id = $1",
+            user_id
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚛 Yangi yo'nalish tanlash", callback_data="choose_route")]
+    ])
+    await callback.message.edit_text("⏸ Qidiruv to'xtatildi. Istalgan vaqt qayta yoqishingiz mumkin.", reply_markup=kb)
+
+
+def detect_route(text: str):
+    """Matndan qaysi viloyatdan qaysi viloyatga ekanligini aniqlaydi."""
+    clean = text.lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    found = []
+    for key, (_, keywords) in REGIONS.items():
+        for kw in keywords:
+            match = re.search(rf"\b{re.escape(kw)}", clean)
+            if match:
+                found.append((match.start(), key))
+                break
+    found.sort(key=lambda x: x[0])
+    if len(found) >= 2 and found[0][1] != found[1][1]:
+        return found[0][1], found[1][1]
+    return None, None
+
+
+# Telethon Userbot — kanallar va guruhlardan e'lonlarni kuzatish
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+
+@client.on(events.NewMessage(incoming=True))
+async def handle_new_cargo(event):
+    if event.is_private:
+        return
+    text = event.raw_text
+    if not text or len(text) < 10:
+        return
+
+    from_reg, to_reg = detect_route(text)
+    if not from_reg or not to_reg:
+        return
+
+    chat = await event.get_chat()
+    chat_title = getattr(chat, "title", "Yuk kanali")
+    username = getattr(chat, "username", None)
+    link = f"\n🔗 <a href='https://t.me/{username}/{event.id}'>E'longa o'tish</a>" if username else ""
+
+    if db_pool:
+        inserted = await db_pool.fetchval("""
+            INSERT INTO elonlar (chat_id, message_id, chat_title, from_region, to_region, text_body)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (chat_id, message_id) DO NOTHING
+            RETURNING id;
+        """, event.chat_id, event.id, chat_title, from_reg, to_reg, text[:2000])
+        if not inserted:
+            return
+
+    msg_body = (
+        f"🆕 <b>Yangi yuk! ({REGIONS[from_reg][0]} ➔ {REGIONS[to_reg][0]})</b>\n"
+        f"📢 Manba: {chat_title}\n\n"
+        f"{text[:1500]}{link}"
+    )
+
+    if db_pool:
+        subscribers = await db_pool.fetch(
+            "SELECT user_id FROM obunachilar WHERE active = TRUE AND from_region = $1 AND to_region = $2",
+            from_reg, to_reg
+        )
+        for row in subscribers:
+            uid = row["user_id"]
+            try:
+                await bot.send_message(uid, msg_body, parse_mode="HTML", disable_web_page_preview=True)
+            except TelegramForbiddenError:
+                await db_pool.execute("UPDATE obunachilar SET active = FALSE WHERE user_id = $1", uid)
+                logging.info(f"User {uid} botni bloklagan, active=FALSE qilindi.")
+            except Exception as e:
+                logging.error(f"User {uid} ga yuborishda xato: {e}")
+
+
+# Render.com va UptimeRobot uchun veb-server
+async def health_check(request):
+    return web.Response(text="TezkorYuk Bot 24/7 ishlamoqda!")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server {port}-portda ishga tushdi.")
+
+
+async def main():
+    await init_db()
+    await start_web_server()
+    await client.start()
+    logging.info("Telethon Userbot muvaffaqiyatli ulandi!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
