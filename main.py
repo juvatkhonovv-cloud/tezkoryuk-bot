@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -95,6 +96,7 @@ async def init_db():
                 from_region TEXT NOT NULL,
                 to_region TEXT NOT NULL,
                 truck_type TEXT DEFAULT 'general',
+                text_hash TEXT,
                 text_body TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(chat_id, message_id)
@@ -104,7 +106,36 @@ async def init_db():
             ALTER TABLE elonlar
             ADD COLUMN IF NOT EXISTS truck_type TEXT DEFAULT 'general';
         """)
+        await conn.execute("""
+            ALTER TABLE elonlar
+            ADD COLUMN IF NOT EXISTS text_hash TEXT;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_elonlar_hash_time
+            ON elonlar (text_hash, created_at DESC);
+        """)
     logging.info("PostgreSQL (Supabase) bazasi muvaffaqiyatli ulandi!")
+
+
+async def cleanup_old_cargos():
+    """3 kundan eski e'lonlarni bazadan avtomatik tozalab turadi."""
+    while True:
+        try:
+            await asyncio.sleep(6 * 3600)
+            if db_pool:
+                deleted = await db_pool.execute(
+                    "DELETE FROM elonlar WHERE created_at < NOW() - INTERVAL '3 days'"
+                )
+                logging.info(f"Baza tozalandi (3 kundan eski e'lonlar): {deleted}")
+        except Exception as e:
+            logging.error(f"Bazani tozalashda xato: {e}")
+
+
+def make_text_hash(text: str) -> str:
+    """E'lon matnini normallashtirib yagona SHA-256 iz yaratadi."""
+    normalized = re.sub(r"https?://\S+|@\w+", "", text.lower())
+    normalized = re.sub(r"[^\w\d]+", "", normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def build_regions_keyboard(prefix: str) -> InlineKeyboardMarkup:
@@ -182,7 +213,7 @@ async def admin_stats(callback: types.CallbackQuery):
         f"✅ Faol qidiruvdagilar: <b>{active_users}</b>\n"
         f"⏸ To'xtatgan / bloklaganlar: <b>{inactive_users}</b>\n\n"
         f"📦 So'nggi 24 soatdagi yuklar: <b>{today_cargos}</b>\n"
-        f"🗄 Bazadagi jami yuklar: <b>{total_cargos}</b>"
+        f"🗄 Bazadagi jami yuklar (3 kunlik): <b>{total_cargos}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Yangilash", callback_data="admin:stats")],
@@ -207,7 +238,7 @@ async def admin_top_routes(callback: types.CallbackQuery):
     top_cargos = await db_pool.fetch("""
         SELECT from_region, to_region, COUNT(*) AS cnt
         FROM elonlar
-        WHERE created_at >= NOW() - INTERVAL '7 days'
+        WHERE created_at >= NOW() - INTERVAL '3 days'
         GROUP BY from_region, to_region
         ORDER BY cnt DESC
         LIMIT 5
@@ -231,7 +262,7 @@ async def admin_top_routes(callback: types.CallbackQuery):
     text = (
         "🔥 <b>Eng talabgir yo'nalishlar (Top 5):</b>\n\n"
         f"🚛 <b>Faol haydovchilar bo'yicha:</b>\n{subs_block}\n\n"
-        f"📦 <b>So'nggi 7 kundagi yuklar bo'yicha:</b>\n{cargo_block}"
+        f"📦 <b>So'nggi 3 kundagi yuklar bo'yicha:</b>\n{cargo_block}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin:home")]
@@ -472,62 +503,77 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_cargo(event):
-    if event.is_private:
-        return
-    text = event.raw_text
-    if not text or len(text) < 10:
-        return
-
-    from_reg, to_reg = detect_route(text)
-    if not from_reg or not to_reg:
-        return
-
-    detected_truck = detect_truck_type(text)
-
-    chat = await event.get_chat()
-    chat_title = getattr(chat, "title", "Yuk kanali")
-    username = getattr(chat, "username", None)
-    link = f"\n🔗 <a href='https://t.me/{username}/{event.id}'>E'longa o'tish</a>" if username else ""
-
-    if db_pool:
-        inserted = await db_pool.fetchval("""
-            INSERT INTO elonlar (chat_id, message_id, chat_title, from_region, to_region, truck_type, text_body)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (chat_id, message_id) DO NOTHING
-            RETURNING id;
-        """, event.chat_id, event.id, chat_title, from_reg, to_reg, detected_truck, text[:2000])
-        if not inserted:
+    try:
+        if event.is_private:
+            return
+        text = event.raw_text
+        if not text or len(text) < 10:
             return
 
-    truck_badge = ""
-    if detected_truck in TRUCK_TYPES:
-        truck_badge = f"\n🚛 Mashina: {TRUCK_TYPES[detected_truck][0]}"
+        from_reg, to_reg = detect_route(text)
+        if not from_reg or not to_reg:
+            return
 
-    msg_body = (
-        f"🆕 <b>Yangi yuk! ({REGIONS[from_reg][0]} ➔ {REGIONS[to_reg][0]})</b>"
-        f"{truck_badge}\n"
-        f"📢 Manba: {chat_title}\n\n"
-        f"{text[:1500]}{link}"
-    )
+        detected_truck = detect_truck_type(text)
+        text_hash = make_text_hash(text)
 
-    if db_pool:
-        subscribers = await db_pool.fetch(
-            "SELECT user_id, truck_type FROM obunachilar WHERE active = TRUE AND from_region = $1 AND to_region = $2",
-            from_reg, to_reg
+        chat = await event.get_chat()
+        chat_title = getattr(chat, "title", "Yuk kanali")
+        username = getattr(chat, "username", None)
+        link = f"\n🔗 <a href='https://t.me/{username}/{event.id}'>E'longa o'tish</a>" if username else ""
+
+        if db_pool:
+            # Oxirgi 6 soat ichida boshqa kanal/guruhdan aynan shu matn tushgan-tushmaganini tekshirish
+            duplicate = await db_pool.fetchval("""
+                SELECT 1 FROM elonlar
+                WHERE text_hash = $1
+                  AND created_at >= NOW() - INTERVAL '6 hours'
+                LIMIT 1;
+            """, text_hash)
+            if duplicate:
+                return
+
+            inserted = await db_pool.fetchval("""
+                INSERT INTO elonlar (chat_id, message_id, chat_title, from_region, to_region, truck_type, text_hash, text_body)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (chat_id, message_id) DO NOTHING
+                RETURNING id;
+            """, event.chat_id, event.id, chat_title, from_reg, to_reg, detected_truck, text_hash, text[:2000])
+            if not inserted:
+                return
+
+        truck_badge = ""
+        if detected_truck in TRUCK_TYPES:
+            truck_badge = f"\n🚛 Mashina: {TRUCK_TYPES[detected_truck][0]}"
+
+        msg_body = (
+            f"🆕 <b>Yangi yuk! ({REGIONS[from_reg][0]} ➔ {REGIONS[to_reg][0]})</b>"
+            f"{truck_badge}\n"
+            f"📢 Manba: {chat_title}\n\n"
+            f"{text[:1500]}{link}"
         )
-        for row in subscribers:
-            sub_truck = row["truck_type"] or "all"
-            if sub_truck != "all" and detected_truck != "general" and sub_truck != detected_truck:
-                continue
 
-            uid = row["user_id"]
-            try:
-                await bot.send_message(uid, msg_body, parse_mode="HTML", disable_web_page_preview=True)
-            except TelegramForbiddenError:
-                await db_pool.execute("UPDATE obunachilar SET active = FALSE WHERE user_id = $1", uid)
-                logging.info(f"User {uid} botni bloklagan, active=FALSE qilindi.")
-            except Exception as e:
-                logging.error(f"User {uid} ga yuborishda xato: {e}")
+        if db_pool:
+            subscribers = await db_pool.fetch(
+                "SELECT user_id, truck_type FROM obunachilar WHERE active = TRUE AND from_region = $1 AND to_region = $2",
+                from_reg, to_reg
+            )
+            for row in subscribers:
+                sub_truck = row["truck_type"] or "all"
+                if sub_truck != "all" and detected_truck != "general" and sub_truck != detected_truck:
+                    continue
+
+                uid = row["user_id"]
+                try:
+                    await bot.send_message(uid, msg_body, parse_mode="HTML", disable_web_page_preview=True)
+                except TelegramForbiddenError:
+                    await db_pool.execute("UPDATE obunachilar SET active = FALSE WHERE user_id = $1", uid)
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except Exception as e:
+                    logging.error(f"User {uid} ga yuborishda xato: {e}")
+    except Exception as e:
+        logging.error(f"E'lonni qayta ishlashda kutilmagan xato: {e}")
 
 
 # Render.com va UptimeRobot uchun veb-server
@@ -548,6 +594,7 @@ async def start_web_server():
 
 async def main():
     await init_db()
+    asyncio.create_task(cleanup_old_cargos())
     await start_web_server()
     await client.start()
     logging.info("Telethon Userbot muvaffaqiyatli ulandi!")
