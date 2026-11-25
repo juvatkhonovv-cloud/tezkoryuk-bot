@@ -5,8 +5,8 @@ import re
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -27,6 +27,7 @@ API_HASH = get_required_env("API_HASH")
 BOT_TOKEN = get_required_env("BOT_TOKEN")
 SESSION_STRING = get_required_env("SESSION_STRING")
 DATABASE_URL = get_required_env("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -58,8 +59,8 @@ TRUCK_TYPES = {
     "ref": ("❄️ Refrijerator (Muzlatkich)", ["ref", "refrijerator", "muzlatkich", "xolodilnik", "termo", "muzlatgich"]),
 }
 
-# Vaqtinchalik tanlovlarni saqlash: {user_id: {"from": "...", "to": "..."}}
 user_temp = {}
+admin_waiting_broadcast = set()
 
 
 async def init_db():
@@ -125,6 +126,182 @@ def build_trucks_keyboard() -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"truck:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
+def build_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stats"),
+            InlineKeyboardButton(text="🔥 Top yo'nalishlar", callback_data="admin:top")
+        ],
+        [InlineKeyboardButton(text="📢 Barchaga xabar yuborish", callback_data="admin:broadcast")]
+    ])
+
+
+# ================= ADMIN PANEL =================
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    admin_waiting_broadcast.discard(message.from_user.id)
+    await message.answer(
+        "🛠 <b>Admin boshqaruv paneli</b>\n\nKerakli bo'limni tanlang:",
+        reply_markup=build_admin_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "admin:home")
+async def admin_home(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_waiting_broadcast.discard(callback.from_user.id)
+    await callback.message.edit_text(
+        "🛠 <b>Admin boshqaruv paneli</b>\n\nKerakli bo'limni tanlang:",
+        reply_markup=build_admin_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "admin:stats")
+async def admin_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not db_pool:
+        return
+
+    total_users = await db_pool.fetchval("SELECT COUNT(*) FROM obunachilar") or 0
+    active_users = await db_pool.fetchval("SELECT COUNT(*) FROM obunachilar WHERE active = TRUE") or 0
+    inactive_users = total_users - active_users
+    total_cargos = await db_pool.fetchval("SELECT COUNT(*) FROM elonlar") or 0
+    today_cargos = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM elonlar WHERE created_at >= NOW() - INTERVAL '24 hours'"
+    ) or 0
+
+    text = (
+        "📊 <b>Bot jonli statistikasi:</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
+        f"✅ Faol qidiruvdagilar: <b>{active_users}</b>\n"
+        f"⏸ To'xtatgan / bloklaganlar: <b>{inactive_users}</b>\n\n"
+        f"📦 So'nggi 24 soatdagi yuklar: <b>{today_cargos}</b>\n"
+        f"🗄 Bazadagi jami yuklar: <b>{total_cargos}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Yangilash", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin:home")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin:top")
+async def admin_top_routes(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not db_pool:
+        return
+
+    top_subs = await db_pool.fetch("""
+        SELECT from_region, to_region, COUNT(*) AS cnt
+        FROM obunachilar
+        WHERE active = TRUE
+        GROUP BY from_region, to_region
+        ORDER BY cnt DESC
+        LIMIT 5
+    """)
+    top_cargos = await db_pool.fetch("""
+        SELECT from_region, to_region, COUNT(*) AS cnt
+        FROM elonlar
+        WHERE created_at >= NOW() - INTERVAL '7 days'
+        GROUP BY from_region, to_region
+        ORDER BY cnt DESC
+        LIMIT 5
+    """)
+
+    subs_lines = []
+    for i, r in enumerate(top_subs, 1):
+        f_n = REGIONS.get(r["from_region"], (r["from_region"],))[0]
+        t_n = REGIONS.get(r["to_region"], (r["to_region"],))[0]
+        subs_lines.append(f"{i}. {f_n} ➔ {t_n} — <b>{r['cnt']} ta</b> haydovchi")
+
+    cargo_lines = []
+    for i, r in enumerate(top_cargos, 1):
+        f_n = REGIONS.get(r["from_region"], (r["from_region"],))[0]
+        t_n = REGIONS.get(r["to_region"], (r["to_region"],))[0]
+        cargo_lines.append(f"{i}. {f_n} ➔ {t_n} — <b>{r['cnt']} ta</b> yuk")
+
+    subs_block = "\n".join(subs_lines) if subs_lines else "Hozircha ma'lumot yo'q"
+    cargo_block = "\n".join(cargo_lines) if cargo_lines else "Hozircha ma'lumot yo'q"
+
+    text = (
+        "🔥 <b>Eng talabgir yo'nalishlar (Top 5):</b>\n\n"
+        f"🚛 <b>Faol haydovchilar bo'yicha:</b>\n{subs_block}\n\n"
+        f"📦 <b>So'nggi 7 kundagi yuklar bo'yicha:</b>\n{cargo_block}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin:home")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_prompt(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_waiting_broadcast.add(callback.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:home")]
+    ])
+    await callback.message.edit_text(
+        "📢 <b>Ommaviy xabar yuborish</b>\n\n"
+        "Barcha foydalanuvchilarga yubormoqchi bo'lgan xabaringizni (matn, rasm yoki video) shu yerga yozib yuboring:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.from_user.id == ADMIN_ID)
+async def handle_admin_broadcast_message(message: types.Message):
+    if message.from_user.id not in admin_waiting_broadcast:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    admin_waiting_broadcast.discard(message.from_user.id)
+    if not db_pool:
+        return
+
+    rows = await db_pool.fetch("SELECT user_id FROM obunachilar")
+    total = len(rows)
+    sent = 0
+    blocked = 0
+
+    status_msg = await message.answer(f"⏳ Xabar <b>{total}</b> ta foydalanuvchiga yuborilmoqda...", parse_mode="HTML")
+
+    for row in rows:
+        uid = row["user_id"]
+        try:
+            await message.copy_to(chat_id=uid)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await message.copy_to(chat_id=uid)
+                sent += 1
+            except Exception:
+                blocked += 1
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_pool.execute("UPDATE obunachilar SET active = FALSE WHERE user_id = $1", uid)
+        except Exception:
+            blocked += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Xabar tarqatish yakunlandi!</b>\n\n"
+        f"📨 Yetkazildi: <b>{sent}</b>\n"
+        f"🚫 Bloklagan / xato: <b>{blocked}</b>",
+        reply_markup=build_admin_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+# ================= ASOSIY FOYDALANUVCHI MENYUSI =================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
